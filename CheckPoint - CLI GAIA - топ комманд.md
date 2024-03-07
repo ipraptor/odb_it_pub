@@ -1,5 +1,7 @@
 # CheckPoint - CLI GAIA - топ комманд
-#CheckPoint #CLI 
+###### tags:`CheckPoint` `CLI` `NGFW`
+---
+
 |Команда|Описание|
 |---|---|
 |cpconfig|изменить SIC лицензии и многое другое|
