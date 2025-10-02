@@ -1,0 +1,7 @@
+show vpn ipsec connections   # список коннекшенов и их состояние (up/down)
+show vpn ipsec sa            # активные SA (будет пусто, если SA нет)
+show vpn ipsec state         # kernel crypto state (xfrm, SPI и пр.)
+show vpn ipsec status        # статус демона/подсистемы IPsec
+show vpn ipsec policy        # установленные политики
+
+sudo tcpdump -nn -i eth0 'udp port 500 or udp port 4500' -c 40
