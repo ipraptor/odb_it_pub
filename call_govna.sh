@@ -1,152 +1,123 @@
 #!/usr/bin/env bash
+# Ubuntu: TLS wrapper on TCP/443 for an EXISTING, WORKING SSH on TCP/22.
+# Does not change sshd_config, ssh.socket, firewall, or running SSH sessions.
 set -Eeuo pipefail
 
-# Ubuntu: SSH on 22 behind stunnel TLS on 443.
-# IMPORTANT: run from your provider's VPS console or another verified access path.
-# Changing ssh.socket can disconnect an SSH session currently using port 443.
-
+PORT=443
 SSH_PORT=22
-TLS_PORT=443
 CONF=/etc/stunnel/ssh-tls.conf
 CERT=/etc/stunnel/ssh-tls.crt
 KEY=/etc/stunnel/ssh-tls.key
-PEM=/etc/stunnel/ssh-tls.pem
-UNIT=/etc/systemd/system/ssh-tls.service
-OVERRIDE=/etc/systemd/system/ssh.socket.d/99-ssh-tls.conf
-BACKUP="/root/ssh-tls-backup-$(date +%Y%m%d-%H%M%S)"
-SOCKET_CHANGED=0
-COMPLETE=0
+SERVICE=/etc/systemd/system/ssh-tls.service
+LOG=/var/log/ssh-tls-setup.log
 
-log() { printf '\n== %s ==\n' "$*"; }
-fail() { echo "ERROR: $*" >&2; exit 1; }
-listening() { ss -H -lnt "sport = :$1" | grep -q .; }
+if (( EUID != 0 )); then echo 'Run: sudo bash setup-ssh-tls-fixed.sh' >&2; exit 1; fi
+exec > >(tee -a "$LOG") 2>&1
+trap 'echo "ERROR at line $LINENO. See $LOG" >&2' ERR
+say() { printf '\n== %s ==\n' "$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-rollback() {
-    if [[ "$COMPLETE" == 1 ]]; then return; fi
-    echo 'Setup failed. Attempting to restore the previous ssh.socket settings.' >&2
-    systemctl stop ssh-tls.service 2>/dev/null || true
-    if [[ "$SOCKET_CHANGED" == 1 ]]; then
-        if [[ -f "$BACKUP/socket-override" ]]; then
-            cp -a "$BACKUP/socket-override" "$OVERRIDE"
-        else
-            rm -f "$OVERRIDE"
-        fi
-        systemctl daemon-reload || true
-        systemctl restart ssh.socket || true
-        systemctl restart ssh.service || true
-    fi
-    echo "Backups: $BACKUP" >&2
-    echo 'Check remote access in the VPS console before disconnecting.' >&2
-}
-trap rollback EXIT
+say '1/6: Verify that SSH on 127.0.0.1:22 actually answers'
+# An existing listening socket alone is not sufficient; verify the banner.
+# This check changes nothing on the server.
+ssh_banner=$(timeout 7 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22; IFS= read -r -t 5 line <&3; printf "%s" "$line"' 2>/dev/null || true)
+[[ "$ssh_banner" == SSH-2.0-* ]] || die 'Local SSH at 127.0.0.1:22 did not return an SSH-2.0 banner. SSH settings were NOT changed. Check: sudo ss -lntp | grep :22'
+echo "OK: $ssh_banner"
 
-[[ $EUID == 0 ]] || fail 'Run as root: sudo bash setup-ssh-tls.sh'
-command -v systemctl >/dev/null || fail 'systemd is required.'
-[[ -x /usr/sbin/sshd ]] || fail 'OpenSSH server is missing: /usr/sbin/sshd'
-/usr/sbin/sshd -t || fail 'sshd configuration failed validation.'
-systemctl is-active --quiet ssh.socket || fail 'ssh.socket must be active; no SSH configuration changed.'
+say '2/6: Check whether TCP/443 is available'
+# If a previous run of THIS unit has already configured 443, it is safe to
+# stop that unit and replace its configuration. Never stop ssh/ssh.socket.
+if systemctl is-active --quiet ssh-tls.service 2>/dev/null; then
+  echo 'Stopping the previous ssh-tls.service instance (SSH is untouched).'
+  systemctl stop ssh-tls.service
+fi
+if ss -H -lnt "( sport = :$PORT )" | grep -q .; then
+  ss -lntp "( sport = :$PORT )" || true
+  die 'TCP/443 is occupied. If the listener is SSH, first free 443 using your existing ssh.socket setup; this script will NOT touch SSH.'
+fi
 
-log 'Installing stunnel and openssl'
+say '3/6: Install stunnel and openssl'
+export DEBIAN_FRONTEND=noninteractive
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y stunnel4 openssl
-STUNNEL=$(command -v stunnel4) || fail 'stunnel4 binary not found.'
+apt-get install -y stunnel4 openssl
+STUNNEL_BIN=$(command -v stunnel4 || true)
+[[ -n "$STUNNEL_BIN" ]] || die 'Cannot find stunnel4 executable.'
 
-log 'Backing up existing configuration'
-mkdir -p "$BACKUP" "$(dirname "$OVERRIDE")" /etc/stunnel
-for file in "$OVERRIDE" "$CONF" "$UNIT" /etc/ssh/sshd_config; do
-    if [[ -f "$file" ]]; then
-        cp -a "$file" "$BACKUP/$(echo "$file" | tr / _)"
-    fi
-done
-# An additional, predictable backup name is used for socket rollback.
-[[ ! -f "$OVERRIDE" ]] || cp -a "$OVERRIDE" "$BACKUP/socket-override"
-
-log 'Configuring ssh.socket for TCP 22'
-cat > "$OVERRIDE" <<EOF
-[Socket]
-ListenStream=
-ListenStream=$SSH_PORT
-EOF
-SOCKET_CHANGED=1
-systemctl daemon-reload
-systemctl restart ssh.socket
-systemctl restart ssh.service
-listening "$SSH_PORT" || fail 'Nothing listens on TCP 22.'
-# Verify that a real SSH banner is received, not merely a successful TCP connect.
-timeout 8 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22; IFS= read -r -t 5 banner <&3; [[ "$banner" == SSH-2.0-* ]]' \
-    || fail 'SSH on 127.0.0.1:22 does not return an SSH banner.'
-
-log 'Checking availability of TCP 443'
-if listening "$TLS_PORT"; then
-    ss -lntp "sport = :$TLS_PORT" || true
-    fail 'TCP 443 is still occupied. Check sshd_config, other ssh.socket overrides or web services.'
-fi
-
-log 'Preparing certificate'
-if [[ -f "$CERT" && -f "$PEM" ]]; then
-    echo 'Reusing existing TLS certificate and private key.'
-elif [[ -e "$CERT" || -e "$PEM" || -e "$KEY" ]]; then
-    fail 'Incomplete pre-existing certificate files; inspect /etc/stunnel before retrying.'
+say '4/6: Create or reuse certificate and config'
+install -d -m 700 /etc/stunnel
+if [[ -e "$CERT" || -e "$KEY" ]]; then
+  [[ -s "$CERT" && -s "$KEY" ]] || die 'Only one TLS key/certificate file exists. No keys were overwritten; inspect /etc/stunnel/ssh-tls.{key,crt}.'
+  openssl x509 -in "$CERT" -noout >/dev/null || die 'Existing certificate is invalid.'
+  openssl pkey -in "$KEY" -noout >/dev/null || die 'Existing TLS private key is invalid.'
+  cert_pub=$(openssl x509 -in "$CERT" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256)
+  key_pub=$(openssl pkey -in "$KEY" -pubout -outform DER | openssl dgst -sha256)
+  [[ "$cert_pub" == "$key_pub" ]] || die 'Existing TLS certificate and key do not match.'
+  echo 'Reusing the existing TLS certificate and key.'
 else
-    openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 \
-        -keyout "$KEY" -out "$CERT" \
-        -subj '/CN=ssh-tunnel' -addext 'subjectAltName=DNS:ssh-tunnel'
-    cat "$KEY" "$CERT" > "$PEM"
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 \
+    -keyout "$KEY" -out "$CERT" \
+    -subj '/CN=ssh-tunnel' -addext 'subjectAltName=DNS:ssh-tunnel'
+  echo 'Created a self-signed certificate with DNS SAN ssh-tunnel.'
 fi
-chmod 600 "$PEM"
-[[ ! -f "$KEY" ]] || chmod 600 "$KEY"
+chmod 600 "$KEY"
 chmod 644 "$CERT"
-
-log 'Creating dedicated foreground stunnel service (no PID file)'
 cat > "$CONF" <<EOF
 client = no
 foreground = yes
 sslVersionMin = TLSv1.2
-cert = $PEM
+cert = $CERT
+key = $KEY
+
 [ssh]
-accept = 0.0.0.0:$TLS_PORT
+accept = 0.0.0.0:$PORT
 connect = 127.0.0.1:$SSH_PORT
 EOF
 chmod 600 "$CONF"
-cat > "$UNIT" <<EOF
+cat > "$SERVICE" <<EOF
 [Unit]
-Description=SSH over TLS (stunnel)
-After=network.target ssh.socket
-Requires=ssh.socket
+Description=TLS wrapper for existing SSH (TCP 443 -> 127.0.0.1:22)
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=$STUNNEL $CONF
+ExecStart=$STUNNEL_BIN $CONF
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+say '5/6: Start the dedicated service (no PID file and no SSH restart)'
 systemctl daemon-reload
-systemctl enable ssh-tls.service
-systemctl restart ssh-tls.service
+systemctl enable --now ssh-tls.service
 sleep 2
-if ! systemctl is-active --quiet ssh-tls.service || ! listening "$TLS_PORT"; then
-    journalctl -u ssh-tls.service -n 30 --no-pager || true
-    fail 'stunnel did not start or TCP 443 is not listening.'
+if ! systemctl is-active --quiet ssh-tls.service; then
+  systemctl status ssh-tls.service --no-pager -l || true
+  journalctl -u ssh-tls.service -n 30 --no-pager || true
+  die 'Stunnel service did not stay active; SSH on 22 was not modified.'
+fi
+if ! ss -H -lnt "( sport = :$PORT )" | grep -q .; then
+  journalctl -u ssh-tls.service -n 30 --no-pager || true
+  die 'Service is running but nothing listens on 443.'
 fi
 
-log 'Testing TLS and SSH banner through stunnel'
-# openssl is the TLS client here; unlike raw /dev/tcp it understands TLS.
-if ! timeout 12 openssl s_client -quiet -connect "127.0.0.1:$TLS_PORT" \
-        -servername ssh-tunnel -CAfile "$CERT" -verify_return_error \
-        </dev/null 2>/dev/null | grep -m1 -q '^SSH-2.0-'; then
-    journalctl -u ssh-tls.service -n 20 --no-pager || true
-    fail 'SSH banner was not received through verified TLS.'
-fi
-
-COMPLETE=1
-log 'SUCCESS: SSH over TLS is running'
-echo "SSH backend: 127.0.0.1:$SSH_PORT"
-echo "TLS endpoint: TCP $TLS_PORT"
-echo "Copy this public certificate to Windows: $CERT"
-echo 'Do NOT copy ssh-tls.key or ssh-tls.pem to Windows.'
-echo "Configuration backup: $BACKUP"
-ss -lntp "sport = :$SSH_PORT or sport = :$TLS_PORT" || true
-echo 'Verify an external connection before closing the VPS console.'
+say '6/6: Test TLS handshake against localhost:443'
+# openssl s_client validates TLS independently of SSH. We do not assert that
+# the outside network/firewall works: that must be tested from Windows.
+tls_output=$(timeout 12 openssl s_client -connect 127.0.0.1:443 \
+  -servername ssh-tunnel -CAfile "$CERT" \
+  -verify_hostname ssh-tunnel -verify_return_error -brief </dev/null 2>&1) || {
+  echo "$tls_output"
+  die 'Local TLS handshake or certificate verification failed.'
+}
+echo "$tls_output" | grep -q 'Verification: OK' || {
+  echo "$tls_output"
+  die 'TLS handshake completed but certificate verification did not report OK.'
+}
+printf '\nSUCCESS: SSH on 127.0.0.1:22 is unchanged; Stunnel listens on TCP/443.\n'
+printf 'Copy this PUBLIC certificate to Windows: %s\n' "$CERT"
+printf 'Do NOT copy the private key: %s\n' "$KEY"
+printf 'Check externally: connect with the Windows Stunnel client to SERVER_IP:443.\n'
+printf 'If port 443 is blocked by UFW or a hosting firewall, allow it separately.\n'
+printf 'Diagnostic log: %s\n' "$LOG"
